@@ -1,0 +1,178 @@
+#!/usr/bin/perl -l
+
+use strict;
+use Munin::Plugin;
+use Sys::Virt;
+use XML::Simple;
+
+my %VIRTSTATS = (
+    'cpuacct' => {
+        'graph'   => {
+            'title'   => 'CPU Usage',
+            'vlabel'  => 'jiffies',
+            'args'    => '-l 0',
+            'category'=> 'virt',
+        },
+        'values'  => {
+            'type'   => 'DERIVE',
+            'min'    => 0,
+        },
+    },
+    'memory' => {
+        'graph'   => {
+            'title'   => 'Memory Usage',
+            'vlabel'  => 'Bytes',
+            'args'    => '--base 1024 -l 0',
+            'category'=> 'virt',
+        },
+        'values'  => {
+            'type'   => 'GAUGE',
+            'min'    => 0,
+        },
+    },
+    'blkio' => {
+        'graph'   => {
+            'title'   => 'Disk IO',
+            'vlabel'  => 'Bytes',
+            'args'    => '--base 1024 -l 0',
+            'category'=> 'virt',
+        },
+        'values'  => {
+            'type'   => 'DERIVE',
+            'min'    => 0,
+        },
+    },
+    'network' => {
+        'graph'   => {
+            'title'   => 'Network Traffic',
+            'vlabel'  => 'bps',
+            'args'    => '--base 1024 -l 0',
+            'category'=> 'virt',
+        },
+        'values'  => {
+            'type'   => 'DERIVE',
+            'min'    => 0,
+            'cdef'   => '${label},8,*',
+        },
+    },
+);
+
+###############################################################################
+
+sub genlabel
+{
+    local $_ = shift;
+    s/^[^a-zA-Z_]/_/;
+    s/[^a-zA-Z0-9_]/_/g;
+    $_;
+}
+
+sub fetch
+{
+    my $target = shift;
+    my $vhost  = shift;
+    my $name   = shift;
+    my $entry  = shift;
+    my $filter = shift;
+
+    my $path = qq{/cgroup/${target}/libvirt/${vhost}/${name}/${entry}};
+    my $value= `cat $path`;
+
+    if($filter && ref $filter eq 'CODE') {
+        $value = $filter->($value);
+    }
+
+    chomp $value;
+    return $value;
+}
+
+sub init
+{
+    my %domains = ();
+    my $vmm = Sys::Virt->new('uri' => $_);
+    my $xs  = XML::Simple->new;
+
+    foreach my $dom ($vmm->list_domains) {
+        my $name = $dom->get_name;
+
+        $domains{$name}{'label'} = genlabel($name);
+        $domains{$name}{'desc'}  = $xs->XMLin($dom->get_xml_description);
+
+        $domains{$name}{'values'}{'cpuacct'} =
+            fetch("cpuacct", "qemu", $name, "cpuacct.stat", sub{
+                    my $total = 0;
+                    foreach my $line (split /\n/,shift) {
+                        $total += (split / /,$line)[1];
+                    }
+                    return  $total;
+            });
+
+        $domains{$name}{'values'}{'memory'} =
+            fetch("memory", "qemu", $name, "memory.memsw.usage_in_bytes");
+
+        $domains{$name}{'values'}{'blkio'} =
+            fetch("blkio", "qemu", $name, "blkio.io_service_bytes", sub {
+                    foreach my $line (split /\n/,shift) {
+                        if($line =~ /^Total/) {
+                            return (split / /,$line)[1];
+                        }
+                    }
+            });
+
+        $domains{$name}{'values'}{'network'} = 0;
+        my $interfaces = $domains{$name}{'desc'}{'devices'}{'interface'};
+        foreach my $interface (ref $interfaces eq 'ARRAY' ? @{$interfaces} : ($interfaces))
+        {
+            next unless($interface->{'type'} eq 'bridge');
+            my $stats = $dom->interface_stats($interface->{'target'}{'dev'});
+            $domains{$name}{'values'}{'network'} += $stats->{'tx_bytes'};
+            $domains{$name}{'values'}{'network'} += $stats->{'rx_bytes'};
+        }
+    }
+
+    return %domains;
+}
+
+###############################################################################
+
+my %domains = init;
+
+if(@ARGV >= 1) {
+    if($ARGV[0] eq 'autoconf') {
+        print "no";
+    }
+    if($ARGV[0] eq 'config') {
+        foreach my $graph (keys %VIRTSTATS) {
+            print "multigraph virtstats_${graph}";
+
+            my $graph_config = $VIRTSTATS{$graph}->{"graph"};
+            foreach my $key (keys %{$graph_config}) {
+                print "graph_${key} ", $graph_config->{$key};
+            }
+
+            my $values_config = $VIRTSTATS{$graph}->{"values"};
+            foreach my $dom (keys %domains) {
+                my $label = $domains{$dom}{'label'};
+                print "${label}.label ", $dom;
+                foreach my $key (keys %{$values_config}) {
+                    my $config = $values_config->{$key};
+                    $config =~ s/(\${\w+})/"$1 ? $1 : ''"/gee;
+                    print "${label}.${key} ", $config;
+                }
+            }
+        }
+        print;
+    }
+    exit;
+}
+
+foreach my $graph (keys %VIRTSTATS) {
+    print "multigraph virtstats_${graph}";
+
+    foreach my $dom (keys %domains) {
+        my $label = $domains{$dom}{'label'};
+        print "${label}.value ", $domains{$dom}{'values'}{$graph};
+    }
+
+    print;
+}
