@@ -5,61 +5,6 @@ use Munin::Plugin;
 use Sys::Virt;
 use XML::Simple;
 
-my %VIRTSTATS = (
-    'cpuacct' => {
-        'graph'   => {
-            'title'   => 'CPU Usage',
-            'vlabel'  => '%',
-            'args'    => '-l 0',
-            'category'=> 'virt',
-            'period'  => 'second',
-        },
-        'values'  => {
-            'type'   => 'DERIVE',
-            'min'    => 0,
-        },
-    },
-    'memory' => {
-        'graph'   => {
-            'title'   => 'Memory Usage',
-            'vlabel'  => 'Bytes',
-            'args'    => '--base 1024 -l 0',
-            'category'=> 'virt',
-        },
-        'values'  => {
-            'type'   => 'GAUGE',
-            'min'    => 0,
-        },
-    },
-    'blkio' => {
-        'graph'   => {
-            'title'   => 'Disk IO',
-            'vlabel'  => 'Bytes',
-            'args'    => '--base 1024 -l 0',
-            'category'=> 'virt',
-        },
-        'values'  => {
-            'type'   => 'DERIVE',
-            'min'    => 0,
-        },
-    },
-    'network' => {
-        'graph'   => {
-            'title'   => 'Network Traffic',
-            'vlabel'  => 'bps',
-            'args'    => '--base 1024 -l 0',
-            'category'=> 'virt',
-        },
-        'values'  => {
-            'type'   => 'DERIVE',
-            'min'    => 0,
-            'cdef'   => '${label},8,*',
-        },
-    },
-);
-
-###############################################################################
-
 sub genlabel
 {
     local $_ = shift;
@@ -95,11 +40,12 @@ sub init
 
     foreach my $dom ($vmm->list_domains) {
         my $name = $dom->get_name;
+        my $label= genlabel($name);
 
-        $domains{$name}{'label'} = genlabel($name);
-        $domains{$name}{'desc'}  = $xs->XMLin($dom->get_xml_description);
+        $domains{$label}{'name'} = $name;
+        $domains{$label}{'desc'} = $xs->XMLin($dom->get_xml_description);
 
-        $domains{$name}{'values'}{'cpuacct'} =
+        $domains{$label}{'values'}{'cpuacct'} =
             fetch("cpuacct", "qemu", $name, "cpuacct.stat", sub{
                     my $total = 0;
                     foreach my $line (split /\n/,shift) {
@@ -108,10 +54,10 @@ sub init
                     return  $total;
             });
 
-        $domains{$name}{'values'}{'memory'} =
+        $domains{$label}{'values'}{'memory'} =
             fetch("memory", "qemu", $name, "memory.memsw.usage_in_bytes");
 
-        $domains{$name}{'values'}{'blkio'} =
+        $domains{$label}{'values'}{'blkio'} =
             fetch("blkio", "qemu", $name, "blkio.io_service_bytes", sub {
                     foreach my $line (split /\n/,shift) {
                         if($line =~ /^Total/) {
@@ -120,18 +66,27 @@ sub init
                     }
             });
 
-        $domains{$name}{'values'}{'network'} = 0;
-        my $interfaces = $domains{$name}{'desc'}{'devices'}{'interface'};
+        $domains{$label}{'values'}{'network'} = 0;
+        my $interfaces = $domains{$label}{'desc'}{'devices'}{'interface'};
         foreach my $interface (ref $interfaces eq 'ARRAY' ? @{$interfaces} : ($interfaces))
         {
             next unless($interface->{'type'} eq 'bridge');
             my $stats = $dom->interface_stats($interface->{'target'}{'dev'});
-            $domains{$name}{'values'}{'network'} += $stats->{'tx_bytes'};
-            $domains{$name}{'values'}{'network'} += $stats->{'rx_bytes'};
+            $domains{$label}{'values'}{'network'} += $stats->{'tx_bytes'};
+            $domains{$label}{'values'}{'network'} += $stats->{'rx_bytes'};
         }
     }
 
     return %domains;
+}
+
+sub sort_domain
+{
+    my $domains = shift;
+    my $key     = shift;
+
+    return sort {$domains->{$b}{'values'}{$key} <=> $domains->{$a}{'values'}{$key}}
+           keys %{$domains};
 }
 
 ###############################################################################
@@ -143,23 +98,87 @@ if(@ARGV >= 1) {
         print "no";
     }
     if($ARGV[0] eq 'config') {
-        foreach my $graph (keys %VIRTSTATS) {
-            print "multigraph virtstats_${graph}";
+        # config 'vmnum'
+        print 'multigraph virtstats_vmnum';
+        print 'graph_title Number of VirtualMachine';
+        print 'graph_vlabel vms';
+        print 'graph_args -l 0';
+        print 'graph_category virt';
+        print 'vmnum.label vm';
+        print 'vmnum.type GAUGE';
+        print;
 
-            my $graph_config = $VIRTSTATS{$graph}->{"graph"};
-            foreach my $key (keys %{$graph_config}) {
-                print "graph_${key} ", $graph_config->{$key};
-            }
-
-            my $values_config = $VIRTSTATS{$graph}->{"values"};
-            foreach my $dom (keys %domains) {
-                my $label = $domains{$dom}{'label'};
-                print "${label}.label ", $dom;
-                foreach my $key (keys %{$values_config}) {
-                    my $config = $values_config->{$key};
-                    $config =~ s/(\${\w+})/"$1 ? $1 : ''"/gee;
-                    print "${label}.${key} ", $config;
+        # config 'cpuacct'
+        print 'multigraph virtstats_cpuacct';
+        print 'graph_title CPU Usage';
+        print 'graph_vlabel %';
+        print 'graph_args -l 0';
+        print 'graph_category virt';
+        {
+            my @domain_order = sort_domain(\%domains, 'cpuacct');
+            print 'graph_order ', join " ", @domain_order;
+            foreach my $dom (@domain_order) {
+                print $dom,'.label ',$domains{$dom}{'name'};
+                print $dom,'.type DERIVE';
+                if($dom eq $domain_order[0]) {
+                    print $dom,'.draw AREA';
+                }else {
+                    print $dom,'.draw STACK';
                 }
+            }
+        }
+        print;
+
+        # config 'memory'
+        print 'multigraph virtstats_memory';
+        print 'graph_title Memory Usage';
+        print 'graph_vlabel Bytes';
+        print 'graph_args --base 1024 -l 0';
+        print 'graph_category virt';
+        {
+            my @domain_order = sort_domain(\%domains, 'memory');
+            print 'graph_order ', join " ", @domain_order;
+            foreach my $dom (@domain_order) {
+                print $dom,'.label ',$domains{$dom}{'name'};
+                print $dom,'.type GAUGE';
+                if($dom eq $domain_order[0]) {
+                    print $dom,'.draw AREA';
+                }else {
+                    print $dom,'.draw STACK';
+                }
+            }
+        }
+        print;
+
+        # config 'blkio'
+        print 'multigraph virtstats_blkio';
+        print 'graph_title Disk IO';
+        print 'graph_vlabel Bytes';
+        print 'graph_args --base 1024 -l 0';
+        print 'graph_category virt';
+        {
+            my @domain_order = sort_domain(\%domains, 'blkio');
+            print 'graph_order ', join " ", @domain_order;
+            foreach my $dom (@domain_order) {
+                print $dom,'.label ',$domains{$dom}{'name'};
+                print $dom,'.type DERIVE';
+            }
+        }
+        print;
+
+        # config 'network'
+        print 'multigraph virtstats_network';
+        print 'graph_title Network Traffic';
+        print 'graph_vlabel bps';
+        print 'graph_args --base 1024 -l 0';
+        print 'graph_category virt';
+        {
+            my @domain_order = sort_domain(\%domains, 'network');
+            print 'graph_order ', join " ", @domain_order;
+            foreach my $dom (@domain_order) {
+                print $dom,'.label ',$domains{$dom}{'name'};
+                print $dom,'.type DERIVE';
+                print $dom,".cdef ${dom},8,*";
             }
         }
         print;
@@ -167,13 +186,14 @@ if(@ARGV >= 1) {
     exit;
 }
 
-foreach my $graph (keys %VIRTSTATS) {
+print 'multigraph virtstats_vmnum';
+print 'vmnum.value ', scalar keys %domains;
+print;
+
+foreach my $graph (('cpuacct', 'memory', 'blkio', 'network')) {
     print "multigraph virtstats_${graph}";
-
     foreach my $dom (keys %domains) {
-        my $label = $domains{$dom}{'label'};
-        print "${label}.value ", $domains{$dom}{'values'}{$graph};
+        print $dom,'.value ', $domains{$dom}{'values'}{$graph};
     }
-
     print;
 }
