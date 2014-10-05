@@ -9,9 +9,10 @@ my %VIRTSTATS = (
     'cpuacct' => {
         'graph'   => {
             'title'   => 'CPU Usage',
-            'vlabel'  => 'jiffies',
+            'vlabel'  => '%',
             'args'    => '-l 0',
             'category'=> 'virt',
+            'period'  => 'second',
         },
         'values'  => {
             'type'   => 'DERIVE',
